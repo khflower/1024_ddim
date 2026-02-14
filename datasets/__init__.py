@@ -1,6 +1,8 @@
 import os
+import json
 import torch
 import numbers
+from PIL import Image
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
 from torchvision.datasets import CIFAR10
@@ -25,6 +27,35 @@ class Crop(object):
         return self.__class__.__name__ + "(x1={}, x2={}, y1={}, y2={})".format(
             self.x1, self.x2, self.y1, self.y2
         )
+
+
+class CelebAListSubset(torch.utils.data.Dataset):
+    def __init__(self, img_dir, img_list_path, transform=None):
+        self.img_dir = img_dir
+        self.img_list_path = img_list_path
+        self.transform = transform
+        with open(img_list_path, "r") as f:
+            self.files = json.load(f)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        name = self.files[index]
+        path = os.path.join(self.img_dir, name)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing image in subset list: {path}")
+        image = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        # Keep (x, y) structure expected by training loop.
+        return image, 0
+
+
+def _resolve_data_path(args, path):
+    if os.path.isabs(path):
+        return path
+    return os.path.join(args.exp, path)
 
 
 def get_dataset(args, config):
@@ -66,43 +97,65 @@ def get_dataset(args, config):
         y1 = cx - 64
         y2 = cx + 64
         if config.data.random_flip:
+            train_transform = transforms.Compose(
+                [
+                    Crop(x1, x2, y1, y2),
+                    transforms.Resize(config.data.image_size),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                ]
+            )
+        else:
+            train_transform = transforms.Compose(
+                [
+                    Crop(x1, x2, y1, y2),
+                    transforms.Resize(config.data.image_size),
+                    transforms.ToTensor(),
+                ]
+            )
+        eval_transform = transforms.Compose(
+            [
+                Crop(x1, x2, y1, y2),
+                transforms.Resize(config.data.image_size),
+                transforms.ToTensor(),
+            ]
+        )
+
+        # Optional path for strict subset training (e.g. img_list.json first 1024).
+        if getattr(config.data, "use_img_list_subset", False):
+            subset_img_dir = _resolve_data_path(args, config.data.subset_img_dir)
+            subset_img_list = _resolve_data_path(args, config.data.subset_img_list)
+            dataset = CelebAListSubset(
+                img_dir=subset_img_dir,
+                img_list_path=subset_img_list,
+                transform=train_transform,
+            )
+            test_dataset = CelebAListSubset(
+                img_dir=subset_img_dir,
+                img_list_path=subset_img_list,
+                transform=eval_transform,
+            )
+            return dataset, test_dataset
+
+        if config.data.random_flip:
             dataset = CelebA(
                 root=os.path.join(args.exp, "datasets", "celeba"),
                 split="train",
-                transform=transforms.Compose(
-                    [
-                        Crop(x1, x2, y1, y2),
-                        transforms.Resize(config.data.image_size),
-                        transforms.RandomHorizontalFlip(),
-                        transforms.ToTensor(),
-                    ]
-                ),
+                transform=train_transform,
                 download=True,
             )
         else:
             dataset = CelebA(
                 root=os.path.join(args.exp, "datasets", "celeba"),
                 split="train",
-                transform=transforms.Compose(
-                    [
-                        Crop(x1, x2, y1, y2),
-                        transforms.Resize(config.data.image_size),
-                        transforms.ToTensor(),
-                    ]
-                ),
+                transform=train_transform,
                 download=True,
             )
 
         test_dataset = CelebA(
             root=os.path.join(args.exp, "datasets", "celeba"),
             split="test",
-            transform=transforms.Compose(
-                [
-                    Crop(x1, x2, y1, y2),
-                    transforms.Resize(config.data.image_size),
-                    transforms.ToTensor(),
-                ]
-            ),
+            transform=eval_transform,
             download=True,
         )
 

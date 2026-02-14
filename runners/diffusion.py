@@ -1,12 +1,20 @@
 import os
+import re
+import sys
+import json
 import logging
 import time
 import glob
+import shutil
+import subprocess
 
 import numpy as np
 import tqdm
 import torch
 import torch.utils.data as data
+from PIL import Image
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 
 from models.diffusion import Model
 from models.ema import EMAHelper
@@ -94,6 +102,36 @@ class Diffusion(object):
             # [posterior_variance[1:2], betas[1:]], dim=0).log()
         elif self.model_var_type == "fixedsmall":
             self.logvar = posterior_variance.clamp(min=1e-20).log()
+        self._mem_train_vectors = None
+        self._warned_symlink_ckpt = False
+
+    def _resume_ckpt_path(self):
+        latest = os.path.join(self.args.log_path, "ckpt_latest.pth")
+        default = os.path.join(self.args.log_path, "ckpt.pth")
+        if os.path.exists(latest):
+            return latest
+        return default
+
+    def _save_ckpts(self, states, step):
+        step_path = os.path.join(self.args.log_path, f"ckpt_{step}.pth")
+        latest_path = os.path.join(self.args.log_path, "ckpt_latest.pth")
+        default_path = os.path.join(self.args.log_path, "ckpt.pth")
+
+        torch.save(states, step_path)
+        torch.save(states, latest_path)
+
+        # Keep legacy behavior for non-symlinked ckpt.pth.
+        # If ckpt.pth is a symlink to a base pretrained checkpoint,
+        # avoid overwriting that source file.
+        if os.path.islink(default_path):
+            if not self._warned_symlink_ckpt:
+                logging.info(
+                    f"Detected symlinked {default_path}; preserving symlink target. "
+                    f"Use {latest_path} for latest resume."
+                )
+                self._warned_symlink_ckpt = True
+            return
+        torch.save(states, default_path)
 
     def train(self):
         args, config = self.args, self.config
@@ -120,7 +158,9 @@ class Diffusion(object):
 
         start_epoch, step = 0, 0
         if self.args.resume_training:
-            states = torch.load(os.path.join(self.args.log_path, "ckpt.pth"))
+            resume_path = self._resume_ckpt_path()
+            logging.info(f"Resuming from checkpoint: {resume_path}")
+            states = torch.load(resume_path)
             model.load_state_dict(states[0])
 
             states[1]["param_groups"][0]["eps"] = self.config.optim.eps
@@ -181,21 +221,150 @@ class Diffusion(object):
                     if self.config.model.ema:
                         states.append(ema_helper.state_dict())
 
-                    torch.save(
-                        states,
-                        os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
+                    self._save_ckpts(states, step)
+
+                if self._should_eval(step):
+                    fid, mem = self.evaluate_metrics(
+                        model=model,
+                        ema_helper=ema_helper,
+                        step=step,
                     )
-                    torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
+                    tb_logger.add_scalar("eval/fid", fid, global_step=step)
+                    tb_logger.add_scalar("eval/mem_ratio", mem, global_step=step)
+                    logging.info(f"step: {step}, fid: {fid}, mem_ratio: {mem}")
 
                 data_start = time.time()
+                if step >= self.config.training.n_iters:
+                    return
+
+    def _should_eval(self, step):
+        eval_cfg = getattr(self.config, "eval", None)
+        if eval_cfg is None or not getattr(eval_cfg, "enable", False):
+            return False
+        freq = int(getattr(eval_cfg, "freq", 0))
+        return freq > 0 and step % freq == 0
+
+    def _celeba_eval_transform(self):
+        cx = 89
+        cy = 121
+        x1 = cy - 64
+        y1 = cx - 64
+        return transforms.Compose(
+            [
+                transforms.Lambda(lambda img: TF.crop(img, x1, y1, 128, 128)),
+                transforms.Resize(self.config.data.image_size),
+                transforms.ToTensor(),
+            ]
+        )
+
+    def _load_mem_train_vectors(self):
+        if self._mem_train_vectors is not None:
+            return self._mem_train_vectors
+        if not getattr(self.config.data, "use_img_list_subset", False):
+            raise ValueError("MEM eval expects data.use_img_list_subset=true")
+
+        img_dir = self.config.data.subset_img_dir
+        list_path = self.config.data.subset_img_list
+        with open(list_path, "r") as f:
+            files = json.load(f)
+        transform = self._celeba_eval_transform()
+        tensors = []
+        for name in files:
+            p = os.path.join(img_dir, name)
+            img = Image.open(p).convert("RGB")
+            tensors.append(transform(img))
+        x = torch.stack(tensors, dim=0).to(self.device)
+        x = data_transform(self.config, x).view(x.shape[0], -1)
+        self._mem_train_vectors = x
+        return self._mem_train_vectors
+
+    def _compute_mem_ratio(self, gen_samples):
+        eval_cfg = self.config.eval
+        gap_threshold = float(getattr(eval_cfg, "gap_threshold", 0.3333))
+        mem_batch = int(getattr(eval_cfg, "mem_batch_size", 128))
+        train_vecs = self._load_mem_train_vectors()
+        gen_vecs = gen_samples.view(gen_samples.shape[0], -1).to(self.device)
+        ratios = []
+        with torch.no_grad():
+            for i in range(0, gen_vecs.shape[0], mem_batch):
+                g = gen_vecs[i : i + mem_batch]
+                dist = torch.cdist(g, train_vecs, p=2)
+                knn2 = torch.topk(dist, k=2, dim=1, largest=False).values
+                ratio = knn2[:, 0] / (knn2[:, 1] + 1e-12)
+                ratios.append(ratio)
+        ratios = torch.cat(ratios, dim=0)
+        return (ratios < gap_threshold).float().mean().item()
+
+    def _compute_fid(self, real_path, gen_path):
+        cmd = [sys.executable, "-m", "pytorch_fid", real_path, gen_path, "--device", str(self.device)]
+        out = subprocess.check_output(cmd, text=True)
+        # Expected output contains "FID: <value>"
+        m = re.search(r"FID:\s*([0-9eE+.\-]+)", out)
+        if m is None:
+            raise RuntimeError(f"Failed to parse FID output: {out}")
+        return float(m.group(1))
+
+    def evaluate_metrics(self, model, ema_helper, step):
+        eval_cfg = self.config.eval
+        n_samples = int(getattr(eval_cfg, "n_samples", 1024))
+        batch_size = int(getattr(eval_cfg, "batch_size", self.config.sampling.batch_size))
+        use_ema = bool(getattr(eval_cfg, "use_ema_for_eval", True))
+        keep_samples = bool(getattr(eval_cfg, "keep_samples", False))
+
+        gen_dir = os.path.join(self.args.exp, "eval_samples", self.args.doc, f"step_{step}")
+        os.makedirs(gen_dir, exist_ok=True)
+
+        eval_model = model
+        if use_ema and ema_helper is not None:
+            eval_model = ema_helper.ema_copy(model)
+        eval_model.eval()
+
+        gen_model_space = []
+        done = 0
+        with torch.no_grad():
+            while done < n_samples:
+                n = min(batch_size, n_samples - done)
+                x = torch.randn(
+                    n,
+                    self.config.data.channels,
+                    self.config.data.image_size,
+                    self.config.data.image_size,
+                    device=self.device,
+                )
+                s = self.sample_image(x, eval_model)
+                gen_model_space.append(s.detach().clone())
+                s_img = inverse_data_transform(self.config, s)
+                for i in range(n):
+                    tvu.save_image(s_img[i], os.path.join(gen_dir, f"{done + i:06d}.png"))
+                done += n
+
+        gen_model_space = torch.cat(gen_model_space, dim=0)
+        real_path = getattr(eval_cfg, "real_images_dir", self.config.data.subset_img_dir)
+
+        fid = float("nan")
+        mem = float("nan")
+        try:
+            fid = self._compute_fid(real_path, gen_dir)
+        except Exception as e:
+            logging.warning(f"FID evaluation failed at step {step}: {e}")
+
+        try:
+            mem = self._compute_mem_ratio(gen_model_space)
+        except Exception as e:
+            logging.warning(f"MEM evaluation failed at step {step}: {e}")
+
+        if not keep_samples:
+            shutil.rmtree(gen_dir, ignore_errors=True)
+        return fid, mem
 
     def sample(self):
         model = Model(self.config)
 
         if not self.args.use_pretrained:
             if getattr(self.config.sampling, "ckpt_id", None) is None:
+                ckpt_path = self._resume_ckpt_path()
                 states = torch.load(
-                    os.path.join(self.args.log_path, "ckpt.pth"),
+                    ckpt_path,
                     map_location=self.config.device,
                 )
             else:
