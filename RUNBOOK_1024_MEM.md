@@ -1,9 +1,4 @@
-# DDIM 1024-shot Memorization Runbook (KR/EN)
 
-## 1) 목적 (Goal / Scope)
-- Official `ddim` codebase에서 CelebA 64x64 pretrained checkpoint를 기준으로 `resume training`.
-- 학습 데이터는 `/data/CelebA/img_list.json` 순서 기준 `first 1024`만 사용.
-- 학습 중간에 `FID` + `mem_ratio`를 주기적으로 기록하여 memorization 동향 추적.
 
 실험 범위:
 - Dataset: CelebA
@@ -118,22 +113,6 @@ python /kh_code/ddim_kkh/ddim/scripts/extract_celeba_1024.py --mode copy
   - `eps: 1e-8`
   - `weight_decay: 0`
 
-### 실행 전 준비 (공통)
-```bash
-# 1) run directory
-mkdir -p /data/CelebA/ckpt/logs/celeba1024_ft
-mkdir -p /data/CelebA/ckpt/tensorboard/celeba1024_ft
-
-# 2) base checkpoint를 run path에 copy (symlink 대신 copy 권장)
-cp /kh_code/ddim_kkh/ddim/ckpt.pth /data/CelebA/ckpt/logs/celeba1024_ft/ckpt.pth
-
-# 3) 시작 step 확인 (500000 기대)
-python - <<'PY'
-import torch
-s=torch.load('/data/CelebA/ckpt/logs/celeba1024_ft/ckpt.pth', map_location='cpu')
-print('step', s[3], 'epoch', s[2])
-PY
-```
 
 ### Resume training (single GPU)
 ```bash
@@ -164,15 +143,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py \
   --exp /data/CelebA/ckpt \
   --doc celeba1024_ft_v2 \
   --resume_training --ni
-```
-
-### 재시작/중단 관련 운영 팁
-```bash
-# 같은 run의 중복 프로세스 확인
-ps -eo pid,etime,cmd | rg "celeba_1024_ft.yml --exp /data/CelebA/ckpt --doc celeba1024_ft"
-
-# 필요 시 종료
-pkill -f "python main.py --config celeba_1024_ft.yml --exp /data/CelebA/ckpt --doc celeba1024_ft --resume_training --ni"
 ```
 
 ### 로그/모니터링
@@ -210,24 +180,7 @@ ls -lah /data/CelebA/ckpt/logs/celeba1024_ft | rg "ckpt_.*\\.pth|ckpt_latest\\.p
   - `eval/fid`
   - `eval/mem_ratio`
 
-### C) checkpoint 저장 안전성 강화
-- File: `ddim/runners/diffusion.py`
-- Changed:
-  - save output을 `ckpt_<step>.pth` + `ckpt_latest.pth`로 운영
-  - `ckpt.pth`가 symlink일 경우 write 금지
-  - resume는 `ckpt_latest.pth` 우선, 없으면 `ckpt.pth`
-- Purpose:
-  - base pretrained checkpoint overwrite 방지
-  - run checkpoint lineage 분리
-
-### D) FID parse 안정화
-- File: `ddim/runners/diffusion.py`
-- Changed:
-  - FID parsing regex를 `r"FID:\s*([0-9eE+.\-]+)"`로 고정
-- Purpose:
-  - 이전 `fid: nan` (파싱 실패) 재발 방지
-
-### E) runbook 기준 재현 파일
+### C) runbook 기준 재현 파일
 - Config: `ddim/configs/celeba_1024_ft.yml`
 - Data extractor: `ddim/scripts/extract_celeba_1024.py`
 - Main runner: `ddim/runners/diffusion.py`
