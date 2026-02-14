@@ -55,6 +55,10 @@ python -m pip install tensorboard pandas lmdb pytorch-fid scipy==1.9.3 protobuf=
   - `/kh_code/ddim_kkh/ddim/data/celeba_1024/selected_1024_from_img_list.json`
   - `/kh_code/ddim_kkh/ddim/data/celeba_1024/selected_1024_from_img_list.txt`
 
+Repo include policy:
+- `selected_1024_from_img_list.json`는 재현성 위해 Git에 포함
+- 실제 이미지(`img_align_celeba/*`)는 용량/라이선스 이슈로 Git 제외
+
 ### 실행
 ```bash
 python /kh_code/ddim_kkh/ddim/scripts/extract_celeba_1024.py --mode copy

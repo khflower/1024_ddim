@@ -1,2 +1,11 @@
 .vscode
 __pycache__/
+
+# Local artifacts
+ckpt.pth
+image_samples/
+logs/
+
+# Keep only the 1024 index json in repo, ignore extracted images
+data/celeba_1024/img_align_celeba/
+data/celeba_1024/selected_1024_from_img_list.txt
